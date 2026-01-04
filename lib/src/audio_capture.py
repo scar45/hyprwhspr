@@ -393,7 +393,10 @@ class AudioCapture:
 
             # Check if thread actually exited
             if self.record_thread.is_alive():
-                print("[WARN] Recording thread did not exit cleanly after 3 seconds", flush=True)
+                # Only warn if this is a normal stop (not during recovery)
+                # During recovery, it's expected that the thread may not exit cleanly when device is dead
+                if not (hasattr(self, 'recovery_in_progress') and self.recovery_in_progress):
+                    print("[WARN] Recording thread did not exit cleanly after 3 seconds", flush=True)
 
         # Thread's finally block handles cleanup - verify it completed
         # Do NOT cleanup here to avoid deadlock (callback may still hold lock)
@@ -718,8 +721,21 @@ class AudioCapture:
             if self.record_thread and self.record_thread.is_alive():
                 self.record_thread.join(timeout=2.0)
                 if self.record_thread.is_alive():
-                    print("[RECOVERY] ERROR: Recording thread did not exit, aborting recovery")
-                    return False
+                    # Thread is stuck (likely in stream.stop() or stream.close() waiting for dead device)
+                    # This is expected during recovery of a truly dead/unplugged device
+                    print("[RECOVERY] Warning: Recording thread stuck in cleanup (device unresponsive)", flush=True)
+
+                    # Try waiting longer before giving up
+                    print("[RECOVERY] Waiting additional 3 seconds for thread cleanup...", flush=True)
+                    self.record_thread.join(timeout=3.0)
+
+                    if self.record_thread.is_alive():
+                        # Still stuck after 5 total seconds - this is a zombie thread
+                        # Abandon it and proceed with recovery anyway
+                        # The zombie thread will eventually time out and die on its own
+                        print("[RECOVERY] Thread still stuck - abandoning zombie thread and proceeding with recovery", flush=True)
+                        print("[RECOVERY] Note: If issues persist, restart the service", flush=True)
+                        self.record_thread = None  # Abandon reference to stuck thread
             
             # Reset tracking
             with self.lock:

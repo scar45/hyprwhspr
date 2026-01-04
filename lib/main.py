@@ -98,8 +98,15 @@ class hyprwhsprApp:
         # Lock for error logging deduplication (protects read-modify-write on _last_mic_error_log_time)
         self._error_log_lock = threading.Lock()
         
-        # Lock for hotplug event debouncing (protects read-modify-write on _last_hotplug_add_time)
+        # Lock for hotplug event debouncing (protects read-modify-write on _last_hotplug_add_time and _last_hotplug_remove_time)
         self._hotplug_lock = threading.Lock()
+        self._last_hotplug_remove_time = float('-inf')  # Last time we processed a device removal
+
+        # Lock for microphone disconnect state (protects _mic_disconnected flag)
+        self._mic_state_lock = threading.Lock()
+
+        # Lock for recovery result writes (prevents race conditions when multiple threads write results)
+        self._recovery_result_lock = threading.Lock()
 
         # Background recovery retry state (for suspend/resume)
         self._background_recovery_needed = threading.Event()  # Signal that recovery should be retried
@@ -284,17 +291,6 @@ class hyprwhsprApp:
         """Called when audio device is plugged in"""
         try:
             device_model = device.get('ID_MODEL') or 'Unknown'
-
-            # Debounce: USB reseat generates multiple 'add' events in quick succession
-            # Only process one event per 2-second window to prevent notification spam
-            # Use lock to ensure thread-safe read-modify-write on _last_hotplug_add_time
-            with self._hotplug_lock:
-                current_time = time.monotonic()
-                if current_time - self._last_hotplug_add_time < 2.0:
-                    print(f"[HOTPLUG] Audio device added (debounced): {device_model}", flush=True)
-                    return
-                self._last_hotplug_add_time = current_time
-            
             print(f"[HOTPLUG] Audio device added: {device_model}", flush=True)
 
             # Determine if we should trigger recovery
@@ -314,6 +310,15 @@ class hyprwhsprApp:
                     should_recover = True
 
             if should_recover:
+                # Debounce recovery attempts: USB reseat generates multiple events in quick succession
+                # Only attempt one recovery per 2-second window to prevent spam
+                with self._hotplug_lock:
+                    current_time = time.monotonic()
+                    if current_time - self._last_hotplug_add_time < 2.0:
+                        print(f"[HOTPLUG] Recovery already attempted recently, skipping duplicate", flush=True)
+                        return
+                    self._last_hotplug_add_time = current_time
+
                 print(f"[HOTPLUG] Triggering recovery in 0.5s (let drivers settle)...", flush=True)
 
                 # Give drivers a moment to settle before attempting recovery
@@ -324,9 +329,12 @@ class hyprwhsprApp:
                     print(f"[HOTPLUG] Recovery successful - microphone ready", flush=True)
                     self._write_recovery_result(True, 'hotplug')
                     # Clear disconnected flag - microphone is back
-                    self._mic_disconnected = False
+                    with self._mic_state_lock:
+                        self._mic_disconnected = False
                     # Clear background recovery flag (hotplug succeeded, no need to retry)
                     self._background_recovery_needed.clear()
+                    # Note: Waybar tray script will show "Microphone reconnected successfully" notification
+                    # based on recovery_result file (v1.13.0 approach)
                 else:
                     print(f"[HOTPLUG] Recovery failed - microphone may not be fully initialized", flush=True)
                     self._write_recovery_result(False, 'hotplug')
@@ -341,17 +349,31 @@ class hyprwhsprApp:
 
             # Determine if this is a significant removal
             configured_name = self.config.get_setting('audio_device_name')
+            is_significant_removal = False
 
             if configured_name:
                 # User has configured a specific device - only mark disconnected if it matches
                 if device_model and configured_name in device_model:
-                    self._mic_disconnected = True
-                    print(f"[HOTPLUG] Configured microphone disconnected", flush=True)
+                    is_significant_removal = True
             else:
                 # No configured device - mark disconnected for any non-Unknown device
                 if device_model != 'Unknown':
+                    is_significant_removal = True
+
+            if is_significant_removal:
+                # Debounce: USB removal generates multiple events
+                # Only process once per 2-second window
+                with self._hotplug_lock:
+                    current_time = time.monotonic()
+                    if current_time - self._last_hotplug_remove_time < 2.0:
+                        # Already processed recently, skip duplicate
+                        return
+                    self._last_hotplug_remove_time = current_time
+
+                with self._mic_state_lock:
                     self._mic_disconnected = True
-                    print(f"[HOTPLUG] Audio device disconnected", flush=True)
+                print(f"[HOTPLUG] Configured microphone disconnected", flush=True)
+                # Note: No direct notification - waybar tray will update status based on mic_present checks
 
             # If currently recording, this will fail gracefully in next audio callback
             # No immediate action needed - recovery will trigger on next recording attempt
@@ -548,7 +570,10 @@ class hyprwhsprApp:
                     self._write_recording_status(False)
 
                     # Check if we know the microphone was disconnected
-                    if self._mic_disconnected:
+                    with self._mic_state_lock:
+                        mic_was_disconnected = self._mic_disconnected
+
+                    if mic_was_disconnected:
                         self._notify_zero_volume("Microphone disconnected - please replug USB microphone", log_level="ERROR")
                     else:
                         self._notify_zero_volume("Microphone not responding - please unplug and replug USB microphone, then try recording again", log_level="ERROR")
@@ -562,7 +587,10 @@ class hyprwhsprApp:
                     self._write_recording_status(False)
 
                     # Check if we know the microphone was disconnected
-                    if self._mic_disconnected:
+                    with self._mic_state_lock:
+                        mic_was_disconnected = self._mic_disconnected
+
+                    if mic_was_disconnected:
                         self._notify_zero_volume("Microphone disconnected - please replug USB microphone", log_level="ERROR")
                     else:
                         self._notify_zero_volume("Microphone stream unstable - please wait a moment and try recording again", log_level="WARN")
@@ -737,6 +765,7 @@ class hyprwhsprApp:
         """Inject transcribed text into active application"""
         try:
             self.text_injector.inject_text(text)
+
             # Play ready sound only if auto-paste is unavailable (clipboard-only mode)
             # When ydotool is available, text is auto-pasted so no notification needed
             if not self.text_injector.ydotool_available:
@@ -744,6 +773,17 @@ class hyprwhsprApp:
                 # Show transcription notification with clipboard action (clipboard-only mode)
                 if self.config.get_setting('show_transcription_notification', True):
                     self._notify_transcription_ready(text)
+
+            # Text injection succeeded - system is fully healthy
+            # Cancel any pending background recovery
+            if self._background_recovery_needed.is_set():
+                print("[HEALTH] Successful recording detected - canceling background recovery", flush=True)
+                self._background_recovery_needed.clear()
+                # Write recovery success result (system self-healed via user activity)
+                self._write_recovery_result(True, 'user_activity_validated')
+                with self._mic_state_lock:
+                    self._mic_disconnected = False
+                self._clear_error_state_signals()
         except Exception as e:
             print(f"[ERROR] Text injection failed: {e}")
 
@@ -916,23 +956,25 @@ class hyprwhsprApp:
 
     def _write_recovery_result(self, success, reason):
         """Write recovery result to file for tray script notification"""
-        try:
-            RECOVERY_RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Use lock to prevent race conditions when multiple threads write results
+        with self._recovery_result_lock:
+            try:
+                RECOVERY_RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-            status = "success" if success else "failed"
-            timestamp = int(time.time())
+                status = "success" if success else "failed"
+                timestamp = int(time.time())
 
-            with open(RECOVERY_RESULT_FILE, 'w') as f:
-                f.write(f"{status}:{reason}:{timestamp}")
+                with open(RECOVERY_RESULT_FILE, 'w') as f:
+                    f.write(f"{status}:{reason}:{timestamp}")
 
-            print(f"[RECOVERY] Result written: {status} ({reason})", flush=True)
+                print(f"[RECOVERY] Result written: {status} ({reason})", flush=True)
 
-            # If recovery succeeded, clear any error state signals
-            if success:
-                self._clear_error_state_signals()
+                # If recovery succeeded, clear any error state signals
+                if success:
+                    self._clear_error_state_signals()
 
-        except Exception as e:
-            print(f"[WARN] Failed to write recovery result: {e}")
+            except Exception as e:
+                print(f"[WARN] Failed to write recovery result: {e}")
 
     def _clear_error_state_signals(self):
         """Clear error state signal files after successful recovery"""
@@ -1063,7 +1105,8 @@ class hyprwhsprApp:
             self._write_recovery_result(True, reason)
 
             # Clear disconnected flag - microphone is back
-            self._mic_disconnected = False
+            with self._mic_state_lock:
+                self._mic_disconnected = False
 
             # Clear background recovery flag (manual recovery succeeded, no need to retry)
             self._background_recovery_needed.clear()
@@ -1154,8 +1197,10 @@ class hyprwhsprApp:
                 if backend_reinit_success:
                     self._write_recovery_result(True, 'suspend_resume')
                     # Clear disconnected flag - microphone is back
-                    self._mic_disconnected = False
+                    with self._mic_state_lock:
+                        self._mic_disconnected = False
                     self._background_recovery_needed.clear()
+                    # Note: Waybar tray script will show notification based on recovery_result
                 else:
                     # Backend reinitialization failed - write failure result and signal that recovery is still needed
                     if backend == 'pywhispercpp':
@@ -1210,6 +1255,21 @@ class hyprwhsprApp:
 
             print(f"[RECOVERY] Background retry attempt {attempt}/{max_attempts}", flush=True)
 
+            # Don't attempt recovery if user is actively recording/processing
+            # This prevents interfering with working recordings
+            if self.is_recording or self.is_processing:
+                print(f"[RECOVERY] Recording/processing active - deferring attempt {attempt}", flush=True)
+                # Wait briefly and check again
+                for _ in range(3):
+                    time.sleep(1)
+                    if not (self.is_recording or self.is_processing):
+                        break
+                # Still active? Skip this attempt - system is clearly working
+                if self.is_recording or self.is_processing:
+                    print(f"[RECOVERY] Still active after deferral - system appears healthy, skipping attempt", flush=True)
+                    # Don't fail the whole retry - just skip this iteration
+                    continue
+
             # Attempt recovery
             if self.audio_capture.recover_audio_capture(f'background_retry_{attempt}'):
                 print("[RECOVERY] Background recovery successful!", flush=True)
@@ -1234,8 +1294,10 @@ class hyprwhsprApp:
                 if backend_reinit_success:
                     self._write_recovery_result(True, 'background_retry')
                     # Clear disconnected flag - microphone is back
-                    self._mic_disconnected = False
+                    with self._mic_state_lock:
+                        self._mic_disconnected = False
                     self._background_recovery_needed.clear()
+                    # Note: Waybar tray script will show notification based on recovery_result
                     return  # Success, exit
                 else:
                     # Backend reinitialization failed - continue retrying
@@ -1253,6 +1315,12 @@ class hyprwhsprApp:
                     time.sleep(1)
 
         # All attempts failed
+        # But first check if system is actually healthy now (successful recording may have occurred)
+        if not self._background_recovery_needed.is_set():
+            print("[RECOVERY] Background recovery no longer needed (system self-healed)", flush=True)
+            return
+
+        # Only complain if system is still broken
         print("[RECOVERY] Background recovery failed after all attempts - mic will need manual reseat", flush=True)
         self._write_recovery_result(False, 'background_retry_exhausted')
         self._background_recovery_needed.clear()
