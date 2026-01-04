@@ -1,9 +1,15 @@
 """
 Theme loading for mic-osd.
 
-Reads colors from Omarchy theme files in ~/.config/omarchy/current/theme/
+Priority (highest to lowest):
+1. Config overrides (~/.config/hyprwhspr/config.json with osd_* keys)
+2. Omarchy theme files (~/.config/omarchy/current/theme/)
+3. Default values (hardcoded fallback)
+
+This allows users to always override, whether on Omarchy or other desktops.
 """
 
+import json
 import os
 import re
 from pathlib import Path
@@ -17,6 +23,17 @@ DEFAULT_COLORS = {
     'bar-color-right': (0.0, 1.0, 0.6),     # Green
     'recording-dot': (1.0, 0.2, 0.33),      # Red
     'text-color': (0.8, 0.84, 0.96, 1.0),   # Light gray
+}
+
+# Default bar settings
+DEFAULT_BAR_SETTINGS = {
+    'num_bars': 32,
+    'bar_width': 4,
+    'bar_gap': 2,
+    'min_bar_height': 2,
+    'amplification': 4.0,
+    'decay_rate': 0.85,
+    'rise_rate': 0.5,
 }
 
 
@@ -47,58 +64,116 @@ def hex_to_rgb(hex_color: str) -> tuple:
         raise ValueError(f"Invalid hex color: {hex_color}")
 
 
-def load_theme() -> dict:
+def load_config() -> dict:
     """
-    Load theme colors from Omarchy theme file.
-    
-    Looks for (in order):
-    1. ~/.config/omarchy/current/theme/mic-osd.css
-    2. ~/.config/omarchy/current/theme/swayosd.css (fallback)
-    
+    Load osd_* settings from hyprwhspr config.json.
+
     Returns:
-        Dict of color name -> RGB(A) tuple
+        Dict with 'colors' and 'bar_settings' keys
+    """
+    config_path = Path.home() / '.config' / 'hyprwhspr' / 'config.json'
+    result = {'colors': {}, 'bar_settings': {}}
+
+    if not config_path.exists():
+        return result
+
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        # Map osd_* color keys to internal color names
+        color_map = {
+            'osd_bar_color_left': 'bar-color-left',
+            'osd_bar_color_right': 'bar-color-right',
+            'osd_background_color': 'background-color',
+            'osd_border_color': 'border-color',
+            'osd_recording_dot_color': 'recording-dot',
+            'osd_text_color': 'text-color',
+        }
+
+        for config_key, internal_key in color_map.items():
+            if config_key in config:
+                try:
+                    result['colors'][internal_key] = hex_to_rgb(config[config_key])
+                except ValueError:
+                    pass  # Skip invalid colors
+
+        # Map osd_* bar settings
+        bar_map = {
+            'osd_num_bars': 'num_bars',
+            'osd_bar_width': 'bar_width',
+            'osd_bar_gap': 'bar_gap',
+            'osd_min_bar_height': 'min_bar_height',
+            'osd_amplification': 'amplification',
+            'osd_decay_rate': 'decay_rate',
+            'osd_rise_rate': 'rise_rate',
+        }
+
+        for config_key, internal_key in bar_map.items():
+            if config_key in config:
+                result['bar_settings'][internal_key] = config[config_key]
+
+    except (json.JSONDecodeError, IOError):
+        pass  # Return empty result on error
+
+    return result
+
+
+def load_theme() -> tuple:
+    """
+    Load theme colors and bar settings.
+
+    Priority (highest to lowest):
+    1. Config overrides (~/.config/hyprwhspr/config.json with osd_* keys)
+    2. Omarchy theme files (~/.config/omarchy/current/theme/)
+    3. Default values
+
+    Returns:
+        Tuple of (colors dict, bar_settings dict)
     """
     colors = DEFAULT_COLORS.copy()
+    bar_settings = DEFAULT_BAR_SETTINGS.copy()
     theme_dir = Path.home() / '.config' / 'omarchy' / 'current' / 'theme'
-    
-    # Try mic-osd specific theme first
+
+    # Layer 1: Apply Omarchy theme (if present)
     mic_osd_path = theme_dir / 'mic-osd.css'
     if mic_osd_path.exists():
         try:
             colors.update(parse_css_colors(mic_osd_path))
-            return colors
         except Exception:
-            pass  # Fall through to swayosd fallback
-    
+            pass
+
     # Fall back to swayosd.css for consistent OSD styling
     swayosd_path = theme_dir / 'swayosd.css'
     if swayosd_path.exists():
         try:
             swayosd_colors = parse_css_colors(swayosd_path)
-            
+
             # Map swayosd colors to mic-osd colors
             if 'background-color' in swayosd_colors:
                 bg = swayosd_colors['background-color']
-                # Add alpha if not present
                 if len(bg) == 3:
                     bg = (*bg, 0.95)
                 colors['background-color'] = bg
-            
+
             if 'border-color' in swayosd_colors:
                 colors['border-color'] = swayosd_colors['border-color']
-                # Also use border color for bar gradient by default
                 colors['bar-color-left'] = swayosd_colors['border-color']
                 colors['bar-color-right'] = swayosd_colors['border-color']
-            
+
             if 'progress' in swayosd_colors:
-                # Use progress color for bars if available
                 colors['bar-color-left'] = swayosd_colors['progress']
                 colors['bar-color-right'] = swayosd_colors['progress']
-            
+
         except Exception:
-            pass  # Use defaults
-    
-    return colors
+            pass
+
+    # Layer 2: Apply config overrides (highest priority)
+    config = load_config()
+    colors.update(config['colors'])
+    bar_settings.update(config['bar_settings'])
+
+    return colors, bar_settings
 
 
 def parse_css_colors(css_path: Path) -> dict:
@@ -132,24 +207,29 @@ def parse_css_colors(css_path: Path) -> dict:
 
 class Theme:
     """
-    Theme singleton for easy access to colors.
+    Theme singleton for easy access to colors and bar settings.
     """
     _instance = None
     _colors = None
-    
+    _bar_settings = None
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._colors = load_theme()
+            cls._colors, cls._bar_settings = load_theme()
         return cls._instance
-    
+
     def get(self, name: str, default=None):
         """Get a color by name."""
         return self._colors.get(name, default or DEFAULT_COLORS.get(name))
-    
+
+    def get_bar_setting(self, name: str, default=None):
+        """Get a bar setting by name."""
+        return self._bar_settings.get(name, default or DEFAULT_BAR_SETTINGS.get(name))
+
     def reload(self):
         """Reload theme from disk."""
-        self._colors = load_theme()
+        self._colors, self._bar_settings = load_theme()
     
     @property
     def background(self):
@@ -182,6 +262,35 @@ class Theme:
         if len(color) == 3:
             return (*color, 1.0)
         return color
+
+    # Bar settings properties
+    @property
+    def num_bars(self):
+        return int(self.get_bar_setting('num_bars'))
+
+    @property
+    def bar_width(self):
+        return int(self.get_bar_setting('bar_width'))
+
+    @property
+    def bar_gap(self):
+        return int(self.get_bar_setting('bar_gap'))
+
+    @property
+    def min_bar_height(self):
+        return int(self.get_bar_setting('min_bar_height'))
+
+    @property
+    def amplification(self):
+        return float(self.get_bar_setting('amplification'))
+
+    @property
+    def decay_rate(self):
+        return float(self.get_bar_setting('decay_rate'))
+
+    @property
+    def rise_rate(self):
+        return float(self.get_bar_setting('rise_rate'))
 
 
 # Global theme instance

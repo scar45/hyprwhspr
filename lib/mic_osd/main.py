@@ -44,12 +44,18 @@ class MicOSD:
         """Start the OSD and run until killed."""
         # Initialize GTK
         Gtk.init()
-        
+
+        # Set application name for window class (used by KDE/Plasma window rules)
+        from gi.repository import GLib
+        GLib.set_prgname('hyprwhspr-osd')
+        GLib.set_application_name('hyprwhspr-osd')
+
         # Load CSS
         load_css()
-        
+
         # Create window (hidden in daemon mode)
         self.window = OSDWindow(self.visualization, self.width, self.height)
+        self.window.set_title('hyprwhspr-osd')
         
         # Start theme watcher for live theme updates
         self.theme_watcher = ThemeWatcher(on_theme_changed=self._on_theme_changed)
@@ -76,10 +82,10 @@ class MicOSD:
         """Show the OSD and start audio monitoring."""
         if self.visible:
             return
-        
+
         self.visible = True
         self.window.set_visible(True)
-        
+
         # Start audio monitoring
         if not self.audio_monitor:
             self.audio_monitor = AudioMonitor(samplerate=44100, blocksize=1024)

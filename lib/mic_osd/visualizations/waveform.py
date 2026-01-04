@@ -1,5 +1,9 @@
 """
 Waveform visualization - shows microphone input as animated vertical bars.
+
+Bar settings can be customized via config.json with osd_* keys:
+  osd_num_bars, osd_bar_width, osd_bar_gap, osd_min_bar_height,
+  osd_amplification, osd_decay_rate, osd_rise_rate
 """
 
 import math
@@ -21,21 +25,21 @@ class WaveformVisualization(BaseVisualization):
     
     def __init__(self):
         super().__init__()
-        
-        # Bar settings
-        self.num_bars = 32
-        self.bar_width = 4
-        self.bar_gap = 2
-        self.min_bar_height = 2
-        
+
+        # Load bar settings from theme (which includes config overrides)
+        self.num_bars = theme.num_bars
+        self.bar_width = theme.bar_width
+        self.bar_gap = theme.bar_gap
+        self.min_bar_height = theme.min_bar_height
+
         # Amplification for more visible response
-        self.amplification = 4.0
-        
+        self.amplification = theme.amplification
+
         # Smoothing for bar heights (makes animation smoother)
         self.bar_heights = np.zeros(self.num_bars)
-        self.decay_rate = 0.85  # How fast bars fall
-        self.rise_rate = 0.5    # How fast bars rise
-        
+        self.decay_rate = theme.decay_rate
+        self.rise_rate = theme.rise_rate
+
         # Animation for pulsing dot
         self.pulse_phase = 0.0
     

@@ -97,13 +97,24 @@ sys.argv = ['mic-osd', '--daemon']
 sys.exit(main())
 """
 
-        # Set LD_PRELOAD for gtk4-layer-shell
+        # Set LD_PRELOAD for gtk4-layer-shell only on wlroots compositors
         env = os.environ.copy()
-        env['LD_PRELOAD'] = '/usr/lib/libgtk4-layer-shell.so'
+        is_wlroots = (
+            os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') or
+            os.environ.get('SWAYSOCK') or
+            any(wm in os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
+                for wm in ['hyprland', 'sway', 'wayfire', 'river'])
+        )
+        if is_wlroots:
+            env['LD_PRELOAD'] = '/usr/lib/libgtk4-layer-shell.so'
 
         try:
+            # Use the same Python interpreter that's running the main app
+            # This ensures the venv with sounddevice is used
+            python_executable = sys.executable
+
             self._process = subprocess.Popen(
-                ['/usr/bin/python3', '-c', code],
+                [python_executable, '-c', code],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

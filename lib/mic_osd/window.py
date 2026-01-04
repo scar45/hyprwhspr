@@ -3,8 +3,12 @@ GTK4 Layer Shell window for mic-osd.
 
 Creates an overlay window at the bottom center of the screen
 for displaying audio visualizations.
+
+Supports both wlroots compositors (Hyprland, Sway) via layer-shell
+and other compositors (KDE Plasma) via regular window mode.
 """
 
+import os
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Gdk', '4.0')
@@ -19,6 +23,25 @@ from gi.repository import Gtk, Gdk, GLib
 
 if LAYER_SHELL_AVAILABLE:
     from gi.repository import Gtk4LayerShell
+
+
+def is_wlroots_compositor() -> bool:
+    """Check if running on a wlroots-based compositor (Hyprland, Sway, etc.)
+
+    Layer-shell only works on wlroots compositors. On KDE/KWin, we need
+    to fall back to a regular window.
+    """
+    # Check for Hyprland
+    if os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
+        return True
+    # Check for Sway
+    if os.environ.get('SWAYSOCK'):
+        return True
+    # Check XDG_CURRENT_DESKTOP for other wlroots compositors
+    desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
+    if any(wm in desktop for wm in ['hyprland', 'sway', 'wayfire', 'river']):
+        return True
+    return False
 
 
 class OSDWindow(Gtk.Window):
@@ -51,31 +74,33 @@ class OSDWindow(Gtk.Window):
         self._setup_drawing_area()
     
     def _setup_layer_shell(self):
-        """Configure layer shell for overlay behavior."""
-        if not LAYER_SHELL_AVAILABLE:
+        """Configure layer shell for overlay behavior (wlroots compositors only)."""
+        self._use_layer_shell = LAYER_SHELL_AVAILABLE and is_wlroots_compositor()
+
+        if not self._use_layer_shell:
             return
-        
+
         # Initialize layer shell - MUST be called before window is realized
         Gtk4LayerShell.init_for_window(self)
-        
+
         # Set namespace for window rules
         Gtk4LayerShell.set_namespace(self, "mic-osd")
-        
+
         # Put on overlay layer (above everything)
         Gtk4LayerShell.set_layer(self, Gtk4LayerShell.Layer.OVERLAY)
-        
+
         # Anchor to bottom only (centers horizontally)
         Gtk4LayerShell.set_anchor(self, Gtk4LayerShell.Edge.BOTTOM, True)
         Gtk4LayerShell.set_anchor(self, Gtk4LayerShell.Edge.LEFT, False)
         Gtk4LayerShell.set_anchor(self, Gtk4LayerShell.Edge.RIGHT, False)
         Gtk4LayerShell.set_anchor(self, Gtk4LayerShell.Edge.TOP, False)
-        
+
         # Margin from bottom
         Gtk4LayerShell.set_margin(self, Gtk4LayerShell.Edge.BOTTOM, 130)
-        
+
         # Don't reserve exclusive space
         Gtk4LayerShell.set_exclusive_zone(self, -1)
-        
+
         # No keyboard input
         Gtk4LayerShell.set_keyboard_mode(self, Gtk4LayerShell.KeyboardMode.NONE)
     
@@ -84,10 +109,13 @@ class OSDWindow(Gtk.Window):
         self.set_decorated(False)
         self.set_resizable(False)
         self.set_default_size(self._width, self._height)
-        
+
+        # Set window class for KDE/Plasma window rules
+        self.set_title('hyprwhspr-osd')
+
         # Make window transparent
         self.add_css_class('mic-osd-window')
-    
+
     def _setup_drawing_area(self):
         """Set up the Cairo drawing area."""
         self.drawing_area = Gtk.DrawingArea()
