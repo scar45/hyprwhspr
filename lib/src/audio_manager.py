@@ -24,24 +24,29 @@ class AudioManager:
             self.start_volume = self.config_manager.get_setting('start_sound_volume', 0.5)
             self.stop_volume = self.config_manager.get_setting('stop_sound_volume', 0.5)
             self.error_volume = self.config_manager.get_setting('error_sound_volume', 0.5)
+            self.ready_volume = self.config_manager.get_setting('ready_sound_volume', 0.5)
             self.start_sound_path = self.config_manager.get_setting('start_sound_path', None)
             self.stop_sound_path = self.config_manager.get_setting('stop_sound_path', None)
             self.error_sound_path = self.config_manager.get_setting('error_sound_path', None)
+            self.ready_sound_path = self.config_manager.get_setting('ready_sound_path', None)
         else:
             self.enabled = False  # Default to disabled
-            self.volume = 0.5  
+            self.volume = 0.5
             self.start_volume = 0.5
             self.stop_volume = 0.5
             self.error_volume = 0.5
+            self.ready_volume = 0.5
             self.start_sound_path = None
             self.stop_sound_path = None
             self.error_sound_path = None
+            self.ready_sound_path = None
 
         # Validate volumes
         self.volume = self._validate_volume(self.volume)
         self.start_volume = self._validate_volume(self.start_volume)
         self.stop_volume = self._validate_volume(self.stop_volume)
         self.error_volume = self._validate_volume(self.error_volume)
+        self.ready_volume = self._validate_volume(self.ready_volume)
         
         # Audio file paths - use custom paths if specified, otherwise fall back to defaults
         # Check HYPRWHSPR_ROOT env var first, then fall back to hardcoded path
@@ -107,10 +112,28 @@ class AudioManager:
         else:
             self.error_sound = self.assets_dir / "ping-error.ogg"
 
+        # Ready sound path resolution (played when transcription is complete and ready to paste)
+        if self.ready_sound_path:
+            # Try the path as-is first (for absolute paths)
+            ready_path = Path(self.ready_sound_path)
+            if ready_path.exists():
+                self.ready_sound = ready_path
+            else:
+                # Try relative to assets directory
+                ready_path = self.assets_dir / self.ready_sound_path
+                if ready_path.exists():
+                    self.ready_sound = ready_path
+                else:
+                    # Fall back to default
+                    self.ready_sound = self.assets_dir / "ping-ready.ogg"
+        else:
+            self.ready_sound = self.assets_dir / "ping-ready.ogg"
+
         # Check if audio files exist
         self.start_sound_available = self.start_sound.exists()
         self.stop_sound_available = self.stop_sound.exists()
         self.error_sound_available = self.error_sound.exists()
+        self.ready_sound_available = self.ready_sound.exists()
 
         if not self.start_sound_available or not self.stop_sound_available or not self.error_sound_available:
             print(f"⚠️  Audio feedback files not found:")
@@ -288,6 +311,18 @@ class AudioManager:
         print(f"🔊 Playing error sound: {self.error_sound} (volume: {self.error_volume})")
         result = self._play_sound(self.error_sound, self.error_volume)
         print(f"🔊 Error sound result: {'Success' if result else 'Failed'}")
+        return result
+
+    def play_ready_sound(self) -> bool:
+        """Play the ready sound (when transcription is complete and text is ready to paste)"""
+        print(f"🔊 play_ready_sound called - enabled: {self.enabled}, available: {self.ready_sound_available}")
+        if not self.enabled or not self.ready_sound_available:
+            print(f"❌ Ready sound blocked - enabled: {self.enabled}, available: {self.ready_sound_available}")
+            return False
+
+        print(f"🔊 Playing ready sound: {self.ready_sound} (volume: {self.ready_volume})")
+        result = self._play_sound(self.ready_sound, self.ready_volume)
+        print(f"🔊 Ready sound result: {'Success' if result else 'Failed'}")
         return result
 
     def set_audio_feedback(self, enabled: bool):

@@ -10,6 +10,7 @@ import os
 import fcntl
 import atexit
 import subprocess
+import signal
 from pathlib import Path
 
 try:
@@ -138,8 +139,16 @@ class hyprwhsprApp:
             except Exception:
                 pass
 
-        # Set up global shortcuts (needed for headless operation)
-        self._setup_global_shortcuts()
+        # Set up signal handlers for external triggering (always enabled)
+        self._setup_signal_handlers()
+
+        # Set up global shortcuts (can be disabled if using external triggers only)
+        use_external_trigger = self.config.get_setting("use_external_trigger", False)
+        if use_external_trigger:
+            print("[INIT] External trigger mode - skipping evdev shortcuts")
+            self.global_shortcuts = None
+        else:
+            self._setup_global_shortcuts()
 
     def _setup_global_shortcuts(self):
         """Initialize global keyboard shortcuts"""
@@ -182,6 +191,38 @@ class hyprwhsprApp:
         except Exception as e:
             print(f"[ERROR] Failed to initialize global shortcuts: {e}")
             self.global_shortcuts = None
+
+    def _setup_signal_handlers(self):
+        """Set up SIGUSR1/SIGUSR2 signal handlers for external triggering.
+
+        This allows triggering recording via signals instead of evdev shortcuts,
+        which is useful when running without input group permissions (e.g., on KDE Plasma).
+
+        Usage:
+            SIGUSR1 - Toggle recording (start if stopped, stop if recording)
+            SIGUSR2 - Stop recording (if currently recording)
+
+        Example:
+            pkill -USR1 -f 'hyprwhspr'  # Toggle recording
+            pkill -USR2 -f 'hyprwhspr'  # Force stop
+        """
+        def sigusr1_handler(signum, frame):
+            """Handle SIGUSR1 - toggle recording"""
+            print("[SIGNAL] Received SIGUSR1 - toggling recording", flush=True)
+            # Run in a thread to avoid blocking the signal handler
+            threading.Thread(target=self._on_shortcut_triggered, daemon=True).start()
+
+        def sigusr2_handler(signum, frame):
+            """Handle SIGUSR2 - stop recording"""
+            if self.is_recording:
+                print("[SIGNAL] Received SIGUSR2 - stopping recording", flush=True)
+                threading.Thread(target=self._stop_recording, daemon=True).start()
+            else:
+                print("[SIGNAL] Received SIGUSR2 - not recording, ignored", flush=True)
+
+        signal.signal(signal.SIGUSR1, sigusr1_handler)
+        signal.signal(signal.SIGUSR2, sigusr2_handler)
+        print("[INIT] Signal handlers enabled (SIGUSR1=toggle, SIGUSR2=stop)")
 
     def _setup_device_monitor(self):
         """Initialize device hotplug monitoring for automatic microphone recovery"""
@@ -696,6 +737,13 @@ class hyprwhsprApp:
         """Inject transcribed text into active application"""
         try:
             self.text_injector.inject_text(text)
+            # Play ready sound only if auto-paste is unavailable (clipboard-only mode)
+            # When ydotool is available, text is auto-pasted so no notification needed
+            if not self.text_injector.ydotool_available:
+                self.audio_manager.play_ready_sound()
+                # Show transcription notification with clipboard action (clipboard-only mode)
+                if self.config.get_setting('show_transcription_notification', True):
+                    self._notify_transcription_ready(text)
         except Exception as e:
             print(f"[ERROR] Text injection failed: {e}")
 
@@ -734,6 +782,72 @@ class hyprwhsprApp:
             )
         except Exception:
             pass  # Silently fail if notify-send not available
+
+    def _notify_transcription_ready(self, text: str):
+        """Show notification with transcribed text and button to open clipboard manager.
+
+        Designed for KDE Plasma clipboard-only mode. Shows the full transcription
+        with an action button to open KDE's Klipper clipboard manager (Meta+V).
+        """
+        def show_notification():
+            try:
+                # Truncate display text for notification (keep full text in clipboard)
+                display_text = text if len(text) <= 200 else text[:197] + "..."
+
+                # Try notify-send with action button (requires libnotify 0.8+)
+                # -A action_key=label returns action_key if clicked
+                result = subprocess.run(
+                    [
+                        "notify-send",
+                        "-a", "hyprwhspr",  # App name (replaces "notify-send" in header)
+                        "-i", "audio-input-microphone-symbolic",
+                        "-u", "normal",
+                        "-t", "10000",  # 10 second timeout
+                        "-A", "clipboard=Open Clipboard",
+                        #"Captured the following:",  # Title (summary)
+                        display_text                # Body
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15  # Allow time for user to click
+                )
+
+                # Check if user clicked "Open Clipboard" action
+                if result.returncode == 0 and result.stdout.strip() == "clipboard":
+                    # Open KDE Klipper clipboard manager
+                    self._open_clipboard_manager()
+
+            except subprocess.TimeoutExpired:
+                pass  # User didn't interact, that's fine
+            except FileNotFoundError:
+                pass  # notify-send not available
+            except Exception as e:
+                print(f"[WARN] Transcription notification failed: {e}")
+
+        # Run in background thread to avoid blocking
+        threading.Thread(target=show_notification, daemon=True).start()
+
+    def _open_clipboard_manager(self):
+        """Open KDE's Klipper clipboard manager popup"""
+        try:
+            # Try qdbus to show Klipper popup (most reliable on KDE)
+            result = subprocess.run(
+                ["qdbus", "org.kde.klipper", "/klipper", "showKlipperPopupMenu"],
+                capture_output=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                return
+
+            # Fallback: invoke the global shortcut
+            subprocess.run(
+                ["qdbus", "org.kde.kglobalaccel", "/component/klipper",
+                 "invokeShortcut", "show_klipper_popup"],
+                capture_output=True,
+                timeout=2
+            )
+        except Exception as e:
+            print(f"[WARN] Could not open clipboard manager: {e}")
 
     def _notify_zero_volume(self, message: str, log_level: str = "WARN"):
         """Notify user about zero-volume recording and optionally signal waybar"""
@@ -1155,17 +1269,25 @@ class hyprwhsprApp:
             print("[ERROR] Failed to initialize Whisper.")
             return False
         
-        # Start global shortcuts
+        # Start global shortcuts (optional - can run with signal-only mode)
+        use_external_trigger = self.config.get_setting("use_external_trigger", False)
         if self.global_shortcuts:
             if not self.global_shortcuts.start():
                 print("[ERROR] Failed to start global shortcuts!")
                 print("[ERROR] Check permissions: you may need to be in 'input' group")
-                return False
-        else:
+                if not use_external_trigger:
+                    return False
+                else:
+                    print("[INFO] Continuing with external trigger mode (SIGUSR1/SIGUSR2)")
+        elif not use_external_trigger:
             print("[ERROR] Global shortcuts not initialized!")
             return False
-        
-        print("\n[READY] hyprwhspr ready - press shortcut to start dictation", flush=True)
+
+        if use_external_trigger:
+            print("\n[READY] hyprwhspr ready - send SIGUSR1 to toggle recording", flush=True)
+            print("[READY]   Toggle: pkill -USR1 -f hyprwhspr", flush=True)
+        else:
+            print("\n[READY] hyprwhspr ready - press shortcut to start dictation", flush=True)
 
         # Clean up any stale recovery file (tray script no longer creates these)
         if RECOVERY_REQUESTED_FILE.exists():
